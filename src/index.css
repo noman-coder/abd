@@ -1,0 +1,83 @@
+@import "tailwindcss";
+ 
+:root {
+  --safe-area-inset-top: env(safe-area-inset-top, 0px);
+  --safe-area-inset-right: env(safe-area-inset-right, 0px);
+  --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-inset-left: env(safe-area-inset-left, 0px);
+  --android-bottom-inset: 0px;
+}
+
+/* Root shell = exact visible height (see src/utils/viewport.ts).
+   100dvh is only the fallback before JS runs. Never use 100vh here. */
+.app-shell {
+  height: var(--app-height, 100dvh);
+  max-height: var(--app-height, 100dvh);
+}
+
+@layer base {
+  html, body, #root {
+    direction: ltr !important;
+    text-align: left;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #f8fafc;
+    background-color: #07080c;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  /* Force all inputs, labels, selects, textareas to strictly initialize LTR and align left */
+  input, textarea, select, button, p, h1, h2, h3, h4, h5, h6, label, span, div {
+    direction: ltr !important;
+  }
+
+  input, textarea {
+    text-align: left !important;
+  }
+}
+
+.font-mono, .tabular-nums {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.ltr, .rtl {
+  direction: ltr !important;
+  text-align: left !important;
+}
+
+/* Printable PDF & Physical Invoice Styling */
+@media print {
+  body {
+    background-color: #ffffff !important;
+    color: #000000 !important;
+  }
+  
+  /* Hide non-printable UI */
+  header, nav, footer, button, .no-print, [aria-label="Bottom Navigation"] {
+    display: none !important;
+  }
+
+  .print-only-container {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+
+  .print-clean-card {
+    background: #ffffff !important;
+    color: #000000 !important;
+    border: 1px solid #d1d5db !important;
+    page-break-inside: avoid;
+  }
+}

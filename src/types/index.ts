@@ -1,0 +1,230 @@
+export type UserRole = 'customer' | 'provider' | 'admin';
+
+export type ProviderCategory = 'delivery_courier' | 'home_technician' | 'cargo_driver';
+
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  phone: string;
+  role: UserRole;
+  password?: string;
+  avatar: string;
+  address?: string;
+  walletBalance: number;
+  status: 'active' | 'pending' | 'blocked' | 'suspended';
+  isDeleted?: boolean;
+  cnic?: string;
+  notes?: string;
+  joinedDate: string;
+  // Provider specific fields
+  providerCategory?: ProviderCategory;
+  serviceSkill?: string;
+  vehicleType?: string;
+  rating?: number;
+  completedJobsCount?: number;
+  isOnline?: boolean;
+  cloudUpdatedAt?: any;
+  passwordUpdatedAt?: string;
+}
+
+export interface SystemSettings {
+  deliveryBaseFee: number;
+  deliveryPerKmFee: number;
+  deliveryUrgentFee: number;
+  technicianVisitingFee: number;
+  technicianHourlyRate: number;
+  platformCommissionRate: number; // percentage (e.g. 15%)
+  platformFixedFee: number;
+  whatsappSupportPhone: string;
+  whatsappDefaultMessage: string;
+  supportHelpline: string;
+}
+
+
+export type OrderCategory = 'custom_delivery' | 'home_services' | 'transport_cargo' | 'event_planning';
+
+export type OrderStatus = 'pending' | 'assigned' | 'on_the_way' | 'work_started' | 'completed' | 'cancelled';
+
+export type PaymentMethod = 'cod' | 'jazzcash' | 'easypaisa' | 'bank_transfer' | 'card';
+
+export interface OrderTimelineEvent {
+  status: OrderStatus;
+  label: string;
+  timestamp: string;
+  note?: string;
+}
+
+export interface CustomDeliveryDetails {
+  itemName: string;
+  estimatedBudget: number;
+  storeName: string;
+  pickupAddress: string;
+  deliveryAddress: string;
+  notes: string;
+  isUrgent: boolean;
+}
+
+export interface HomeServiceDetails {
+  serviceId: string;
+  serviceName: string;
+  category: string;
+  issueDescription: string;
+  selectedIssues: string[];
+  scheduledDate: string;
+  scheduledTimeSlot: string;
+  serviceAddress: string;
+  notes?: string;
+  /** true only if customer ticked the optional urgent dispatch */
+  urgentDispatch?: boolean;
+  urgentFee?: number;
+}
+
+export interface TransportDetails {
+  vehicleId: string;
+  vehicleName: string;
+  pickupLocation: string;
+  dropoffLocation: string;
+  estimatedDistanceKm: number;
+  cargoDescription: string;
+  loadWeightKg: number;
+  needsHelper: boolean;
+  helperCount: number;
+}
+
+export interface EventPlanningDetails {
+  eventType: string; // 'barat' | 'walima' | 'mehndi_mayun' | 'birthday' | 'corporate_seminar' | 'dawat_catering' | 'qawwali_mehfil' | 'milad_majlis' | 'other'
+  eventTitle: string; // e.g. "Muhammad Hamza ki Barat o Dawat"
+  eventDate: string; // YYYY-MM-DD
+  eventTimeSlot: 'day_lunch' | 'evening_dinner' | 'night_party' | 'full_day';
+  guestCount: number; // e.g. 350
+  venueType: 'hall_marquee' | 'home_lawn' | 'farmhouse_ground' | 'need_admin_suggestion';
+  venueNameOrAddress: string; // e.g. "Royal Palace Marquee, Multan Road Khanewal"
+  khanewalArea: string; // Local area in Khanewal
+  budgetRangePkr: number; // Estimated budget
+  selectedServices: string[]; // ['catering', 'tentage_shamiana', 'stage_floral', 'sound_dj', 'photography_drone', 'waiters_crockery', 'generator', 'valet_security']
+  cateringType: 'per_head_buffet' | 'traditional_degain' | 'refreshment_tea' | 'only_setup_no_food';
+  menuDetailsText?: string; // Custom menu
+  numberOfDegs?: number; // If degain selected
+  tentageThemeColor?: string; // Theme e.g. "Royal Gold & White"
+  soundAndStageReq?: string;
+  specialInstructions?: string;
+  contactPersonName: string;
+  contactPersonPhone: string;
+  whatsappNumber: string;
+}
+
+export interface OrderPricing {
+  baseFee: number;
+  serviceOrDeliveryFee: number;
+  itemOrDistanceBudget: number;
+  helperFee: number;
+  platformFee: number;
+  total: number;
+}
+
+export type ExtraWorkStatus = 'pending' | 'approved' | 'rejected';
+
+/** Extra work found on-site. Only the ASSIGNED provider can send it, only the CUSTOMER can approve/reject. */
+export interface ExtraWorkQuote {
+  id: string;
+  description: string;
+  amount: number;
+  status: ExtraWorkStatus;
+  requestedAt: string;
+  requestedById: string;
+  requestedByName: string;
+  respondedAt?: string;
+  responseNote?: string;
+}
+
+export interface OrderReview {
+  rating: number; // 1-5
+  comment: string;
+  tags?: string[];
+  reviewedAt: string;
+}
+
+export interface Order {
+  id: string; // e.g. OS-8021
+  category: OrderCategory;
+  customerId: string;
+  customerName: string;
+  customerPhone: string;
+  deliveryAddress: string;
+  status: OrderStatus;
+  createdAt: string;
+  updatedAt: string;
+  
+  // Specific details based on category
+  deliveryDetails?: CustomDeliveryDetails;
+  serviceDetails?: HomeServiceDetails;
+  transportDetails?: TransportDetails;
+  eventDetails?: EventPlanningDetails;
+  
+  // Pricing and payment
+  pricing: OrderPricing;
+  paymentMethod: PaymentMethod;
+  paymentStatus: 'pending' | 'paid';
+  
+  // Assigned Provider
+  assignedProviderId?: string;
+  assignedProviderName?: string;
+  assignedProviderPhone?: string;
+  assignedProviderAvatar?: string;
+  assignedProviderRating?: number;
+  
+  // Real-time tracking simulation
+  timeline: OrderTimelineEvent[];
+  etaMinutes?: number;
+  currentStepIndex: number; // 0 to 4
+  
+  // Feedback
+  review?: OrderReview;
+
+  // Extra work quotes (approved ones are included in pricing.total)
+  extraWork?: ExtraWorkQuote[];
+  extraWorkTotal?: number;
+  /** Original total before any approved extra work (set by the server) */
+  pricingBaseTotal?: number;
+
+  // Set once the provider wallet has been credited (prevents double credit if admin re-completes)
+  walletCredited?: boolean;
+}
+
+export interface HomeServiceItem {
+  id: string;
+  name: string;
+  category: string;
+  basePrice: number;
+  estimatedDuration: string;
+  description: string;
+  popularIssues: string[];
+  icon: string;
+  assignedProviderId?: string;
+  assignedProviderName?: string;
+  /** Tools & equipment charge shown at booking (PKR). Admin editable per service. Default 350. */
+  equipmentFee?: number;
+  /** OPTIONAL fast/urgent dispatch charge (PKR). Customer must tick it; 0 or empty = option hidden. */
+  urgentDispatchFee?: number;
+  isPublished?: boolean;
+  /** ms timestamp of the last admin change; used by the server to reject stale writes */
+  updatedAt?: number;
+}
+
+export interface TransportVehicleItem {
+  id: string;
+  name: string;
+  capacityKg: number;
+  dimensions: string;
+  baseFare: number;
+  perKmRate: number;
+  helperRate: number;
+  bestFor: string;
+  icon: string;
+  assignedProviderId?: string;
+  assignedProviderName?: string;
+  isPublished?: boolean;
+  /** ms timestamp of the last admin change; used by the server to reject stale writes */
+  updatedAt?: number;
+}

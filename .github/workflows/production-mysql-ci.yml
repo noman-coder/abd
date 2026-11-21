@@ -1,4 +1,4 @@
-name: Khanewal Connect Production Host & 5-Hour Cloudflare Tunnel with Persistent MySQL
+name: Khanewal Connect Production Host & 5-Hour Cloudflare Tunnel with Encrypted Drive Backup
 
 on:
   push:
@@ -17,7 +17,7 @@ on:
           - '4'
           - '5'
       force_fresh_database:
-        description: 'ONLY if the cached backup is corrupt: allow a fresh empty database (old cached data will be ignored)'
+        description: 'ONLY if every Drive backup is corrupt: allow a fresh empty database'
         required: false
         default: 'false'
         type: choice
@@ -31,11 +31,10 @@ concurrency:
 
 jobs:
   host-live-app-with-tunnel:
-    name: Live Host on Custom Domain (5 Hours) & Zero-Loss MySQL Backup
+    name: Live Host on Custom Domain & Encrypted Drive MySQL Backup
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # Max allowed runtime for 5-hour hosting session
+    timeout-minutes: 350
 
-    # 1. Local MySQL 8.0 Service Container
     services:
       mysql:
         image: mysql:8.0
@@ -61,8 +60,6 @@ jobs:
         with:
           node-version: 20
 
-      # Step 8 (permanent fix): if MYSQL_HOST secret is set, the app uses that hosted MySQL.
-      # Data then lives outside the runner and no cache restore / dump is needed.
       - name: Detect MySQL Mode (hosted MySQL vs runner-local MySQL)
         id: dbmode
         env:
@@ -70,118 +67,188 @@ jobs:
         run: |
           if [ -n "$EXT_HOST" ]; then
             echo "external=true" >> "$GITHUB_OUTPUT"
-            echo "Using EXTERNAL hosted MySQL (data is independent of this runner)."
+            echo "Using EXTERNAL hosted MySQL (no Drive backup needed)."
           else
             echo "external=false" >> "$GITHUB_OUTPUT"
-            echo "Using runner-local MySQL with GitHub cache backup."
+            echo "Using runner-local MySQL with encrypted rclone Drive backup."
           fi
 
-      - name: Create Snapshot Backup Directory
-        run: mkdir -p mysql-backup
-
-      # 2. Restore MySQL Snapshot from Previous Workflow Run (Fresh isolated cache key)
-      - name: Restore Persistent MySQL Database Cache
-        id: restore-mysql-cache
+      # ---------------------------------------------------------------
+      # rclone + encrypted remote (kwlcrypt -> gdrive:kwlconnectservice)
+      # Secrets needed:
+      #   RCLONE_CONF      = full text of rclone.conf that has a [gdrive] drive remote
+      #   RCLONE_CRYPT_PASS    = encryption password (any strong string)
+      #   RCLONE_CRYPT_SALT    = second password / salt (different strong string)
+      # ---------------------------------------------------------------
+      - name: Install rclone & Configure Encrypted Drive Remote
         if: steps.dbmode.outputs.external != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: mysql-backup
-          key: khanewal-prod-v4-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            khanewal-prod-v4-${{ runner.os }}-
-            khanewal-prod-v4-
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          CRYPT_PASS: ${{ secrets.RCLONE_CRYPT_PASS }}
+          CRYPT_SALT: ${{ secrets.RCLONE_CRYPT_SALT }}
+        run: |
+          if [ -z "$RCLONE_CONF" ] || [ -z "$CRYPT_PASS" ] || [ -z "$CRYPT_SALT" ]; then
+            echo "ERROR: secrets RCLONE_CONF, RCLONE_CRYPT_PASS and RCLONE_CRYPT_SALT are required."
+            exit 1
+          fi
 
-      # 3. Bulletproof Database Initialization (Safely skips corrupt system dumps)
-      - name: Initialize or Restore MySQL Database
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version | head -n 1
+
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+          cat >> ~/.config/rclone/rclone.conf <<EOF
+
+          [kwlcrypt]
+          type = crypt
+          remote = gdrive:kwlconnectservice
+          filename_encryption = standard
+          directory_name_encryption = true
+          password = $(rclone obscure "$CRYPT_PASS")
+          password2 = $(rclone obscure "$CRYPT_SALT")
+          EOF
+
+          # Make sure the Drive folder exists (creates it if missing). Fails if Drive/auth is broken.
+          rclone mkdir gdrive:kwlconnectservice
+          rclone mkdir kwlcrypt:history
+          echo "Drive folder 'kwlconnectservice' is ready. Backups inside are encrypted (names + content)."
+
+          # Reusable backup script (used by the periodic loop and the final step)
+          cat > "$RUNNER_TEMP/kwl_backup.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p mysql-backup
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          TMP=mysql-backup/snapshot.tmp.gz
+          KEEP=${KEEP_SNAPSHOTS:-48}
+
+          if mysqldump -h 127.0.0.1 -u root --databases omniserve_db \
+               --single-transaction --routines --triggers --events \
+               --add-drop-table --complete-insert 2>/dev/null | gzip -9 > "$TMP" \
+             && gzip -t "$TMP" && [ "$(stat -c%s "$TMP")" -gt 1000 ]; then
+            mv "$TMP" mysql-backup/snapshot.sql.gz
+            OK=0
+            for i in 1 2 3; do
+              if rclone copyto mysql-backup/snapshot.sql.gz "kwlcrypt:history/snapshot-$TS.sql.gz" --retries 3; then
+                OK=1; break
+              fi
+              sleep 5
+            done
+            if [ $OK -eq 1 ]; then
+              echo "[$(date -u +%H:%M:%SZ)] Encrypted snapshot uploaded: snapshot-$TS.sql.gz"
+              # Prune: keep only the newest $KEEP snapshots
+              rclone lsf kwlcrypt:history --files-only | sort | head -n -"$KEEP" | while read -r f; do
+                [ -n "$f" ] && rclone deletefile "kwlcrypt:history/$f"
+              done
+            else
+              echo "[$(date -u +%H:%M:%SZ)] WARNING: Drive upload failed; older Drive snapshots are untouched."
+            fi
+          else
+            rm -f "$TMP"
+            echo "[$(date -u +%H:%M:%SZ)] WARNING: dump failed validation; nothing uploaded, older snapshots kept."
+          fi
+          SCRIPT
+          chmod +x "$RUNNER_TEMP/kwl_backup.sh"
+
+      - name: Initialize or Restore MySQL Database (from encrypted Drive backup)
         if: steps.dbmode.outputs.external != 'true'
         env:
           MYSQL_PWD: root_password_123
           FORCE_FRESH: ${{ github.event.inputs.force_fresh_database || 'false' }}
         run: |
           echo "Waiting for MySQL container readiness..."
-          until mysqladmin ping -h 127.0.0.1 -u root --silent; do
-            sleep 1
-          done
-          echo "MySQL service is healthy and online."
+          until mysqladmin ping -h 127.0.0.1 -u root --silent; do sleep 1; done
+          echo "MySQL service is healthy."
 
-          # Ensure omniserve_db database exists
+          mkdir -p mysql-backup
           mysql -h 127.0.0.1 -u root -e "CREATE DATABASE IF NOT EXISTS omniserve_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
+          # List snapshots from Drive (newest first). If this fails we stop: never start empty by mistake.
+          CANDIDATES=$(rclone lsf kwlcrypt:history --files-only | sort -r | head -n 5) || {
+            echo "ERROR: cannot read Drive backups. Refusing to start with an empty database."
+            exit 1
+          }
+
           RESTORE_DONE=0
-          if [ -f "mysql-backup/snapshot.sql.gz" ]; then
-            echo "=========================================================="
-            echo "Found existing cached MySQL snapshot. Verifying and restoring..."
-            echo "=========================================================="
-            
-            # Filter out any system schema 'mysql', 'sys', 'information_schema' statements that trigger Error 3552 in MySQL 8
-            set +e
-            zcat mysql-backup/snapshot.sql.gz \
-              | sed -E '/(CREATE DATABASE|USE)[[:space:]]+`?(mysql|sys|performance_schema|information_schema)`?/Id' \
-              | sed -E 's/DEFINER=`[^`]+`@`[^`]+`//g' \
-              | mysql -h 127.0.0.1 -u root --force omniserve_db 2> restore_log.txt
-            RESTORE_STATUS=$?
-            set -e
+          if [ -n "$CANDIDATES" ]; then
+            for f in $CANDIDATES; do
+              echo "=========================================================="
+              echo "Trying encrypted backup: $f"
+              echo "=========================================================="
+              rm -f mysql-backup/restore.sql.gz
+              if ! rclone copyto "kwlcrypt:history/$f" mysql-backup/restore.sql.gz --retries 3; then
+                echo "Download/decrypt failed for $f, trying older one..."
+                continue
+              fi
+              if ! gzip -t mysql-backup/restore.sql.gz; then
+                echo "$f is corrupt (gzip test failed), trying older one..."
+                continue
+              fi
 
-            TABLE_COUNT=$(mysql -h 127.0.0.1 -u root omniserve_db -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'omniserve_db';" 2>/dev/null || echo 0)
-            echo "Tables found after restore attempt: $TABLE_COUNT"
+              mysql -h 127.0.0.1 -u root -e "DROP DATABASE IF EXISTS omniserve_db; CREATE DATABASE omniserve_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+              set +e
+              zcat mysql-backup/restore.sql.gz \
+                | sed -E '/(CREATE DATABASE|USE)[[:space:]]+`?(mysql|sys|performance_schema|information_schema)`?/Id' \
+                | sed -E 's/DEFINER=`[^`]+`@`[^`]+`//g' \
+                | mysql -h 127.0.0.1 -u root --force omniserve_db 2> restore_log.txt
+              set -e
 
-            if [ "$TABLE_COUNT" -gt 0 ]; then
-              echo "Snapshot restored successfully! Tables verified."
-              RESTORE_DONE=1
-            else
-              echo "Notice: Snapshot did not contain valid tables or was from an incompatible schema. Error log:"
-              cat restore_log.txt || true
+              TABLE_COUNT=$(mysql -h 127.0.0.1 -u root omniserve_db -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'omniserve_db';" 2>/dev/null || echo 0)
+              echo "Tables found after restore: $TABLE_COUNT"
+              if [ "$TABLE_COUNT" -gt 0 ]; then
+                echo "Restored successfully from $f"
+                RESTORE_DONE=1
+                break
+              fi
+              echo "Restore from $f produced no tables. Log:"; cat restore_log.txt || true
+            done
+
+            if [ $RESTORE_DONE -eq 0 ]; then
               if [ "$FORCE_FRESH" = "true" ]; then
-                echo "force_fresh_database=true: proceeding to fresh clean schema initialization..."
+                echo "force_fresh_database=true: starting with a fresh schema."
+                mysql -h 127.0.0.1 -u root -e "DROP DATABASE IF EXISTS omniserve_db; CREATE DATABASE omniserve_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
               else
-                echo "=========================================================="
-                echo "ERROR: A cached backup exists but restore FAILED."
-                echo "Refusing to start with an empty database (that would wipe your data)."
-                echo "Your old cache and the workflow artifact snapshot are untouched."
-                echo "If you really want a fresh database, re-run with force_fresh_database = true."
-                echo "=========================================================="
+                echo "ERROR: Drive backups exist but none could be restored (wrong crypt keys?)."
+                echo "Refusing to start with an empty DB. Drive backups are untouched."
+                echo "Re-run with force_fresh_database=true only if you really want a new DB."
                 exit 1
               fi
             fi
+          else
+            echo "No backups in Drive yet (first run). Starting fresh."
           fi
 
           if [ $RESTORE_DONE -eq 0 ]; then
-            echo "=========================================================="
             echo "Initializing fresh production schema from db/schema.sql..."
-            echo "=========================================================="
             mysql -h 127.0.0.1 -u root omniserve_db < db/schema.sql
-            echo "Fresh schema and initial seed data initialized successfully."
           fi
 
-          # Sync Super Admin credentials from GitHub Secrets if provided
           ADMIN_USER_SECRET="${{ secrets.ADMIN_USERNAME }}"
           ADMIN_PASS_SECRET="${{ secrets.ADMIN_PASSWORD }}"
           if [ -n "$ADMIN_USER_SECRET" ]; then
-            echo "Applying configured ADMIN_USERNAME from GitHub secrets to MySQL..."
             mysql -h 127.0.0.1 -u root omniserve_db -e "UPDATE users SET email = '$ADMIN_USER_SECRET' WHERE id = 'usr-admin-1';" || true
           fi
           if [ -n "$ADMIN_PASS_SECRET" ]; then
-            echo "Applying configured ADMIN_PASSWORD from GitHub secrets to MySQL..."
             mysql -h 127.0.0.1 -u root omniserve_db -e "UPDATE users SET password = '$ADMIN_PASS_SECRET' WHERE id = 'usr-admin-1';" || true
           fi
 
           echo "Database verification summary:"
           mysql -h 127.0.0.1 -u omniserve -pomniserve_secure_password omniserve_db -e "
             SELECT 'users' AS table_name, COUNT(*) AS total_rows FROM users
-            UNION ALL
-            SELECT 'services', COUNT(*) FROM services
-            UNION ALL
-            SELECT 'vehicles', COUNT(*) FROM vehicles
-            UNION ALL
-            SELECT 'orders', COUNT(*) FROM orders;
+            UNION ALL SELECT 'services', COUNT(*) FROM services
+            UNION ALL SELECT 'vehicles', COUNT(*) FROM vehicles
+            UNION ALL SELECT 'orders', COUNT(*) FROM orders;
           "
 
-      # 4. Install Dependencies Reliably
+          # Plain restore file must not linger on the runner
+          rm -f mysql-backup/restore.sql.gz
+
       - name: Install Application Dependencies
         run: |
           npm install --legacy-peer-deps --no-audit --no-fund
 
-      # 4b. Configure Firebase from GitHub Secrets (Zero-Loss Persistence)
       - name: Configure Firebase from GitHub Secrets
         env:
           SEC_FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
@@ -194,9 +261,6 @@ jobs:
           SEC_FIREBASE_OAUTH_CLIENT_ID: ${{ secrets.FIREBASE_OAUTH_CLIENT_ID }}
         run: |
           if [ -n "$SEC_FIREBASE_PROJECT_ID" ]; then
-            echo "=========================================================="
-            echo "Injecting Firebase credentials directly from GitHub Secrets..."
-            echo "=========================================================="
             node -e '
               const fs = require("fs");
               const pId = process.env.SEC_FIREBASE_PROJECT_ID || "";
@@ -214,12 +278,11 @@ jobs:
               };
               fs.writeFileSync("firebase-applet-config.json", JSON.stringify(config, null, 2));
             '
-            echo "firebase-applet-config.json dynamically configured from GitHub Secrets!"
+            echo "firebase-applet-config.json configured from GitHub Secrets."
           else
-            echo "Notice: FIREBASE_PROJECT_ID secret not provided in GitHub Secrets. Using existing configuration."
+            echo "Notice: FIREBASE_PROJECT_ID secret not provided. Using existing configuration."
           fi
 
-      # 5. Build Production Frontend Assets
       - name: Build Production Frontend Assets
         env:
           VITE_ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME || 'admin@omniserve.com' }}
@@ -234,17 +297,13 @@ jobs:
           VITE_FIREBASE_OAUTH_CLIENT_ID: ${{ secrets.FIREBASE_OAUTH_CLIENT_ID }}
         run: npm run build
 
-      # 6. Install Cloudflare Tunnel Client (cloudflared)
       - name: Install Cloudflare Tunnel (cloudflared)
         run: |
-          echo "Installing latest cloudflared binary..."
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
           cloudflared --version
 
-      # 7. Unified Runner: Start Server + Start Tunnel + 5-Hour Keep-Alive Monitoring Loop
-      # Keeping these in ONE step guarantees child processes are NOT terminated by GitHub Actions step boundaries!
-      - name: Start Server, Connect Cloudflare Tunnel & Host Live (5 Hours)
+      - name: Start Server, Connect Cloudflare Tunnel & Host Live
         env:
           NODE_ENV: production
           PORT: 3000
@@ -282,20 +341,15 @@ jobs:
           SENDER_NAME: ${{ secrets.SENDER_NAME || 'Khanewal Connect' }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
         run: |
-          echo "=========================================================================="
-          echo " Launching Khanewal Connect Express Application..."
-          echo "=========================================================================="
+          echo "Launching Khanewal Connect Express Application..."
           nohup npx tsx server.ts > app.log 2>&1 &
           APP_PID=$!
           echo "Express server process initiated (PID: $APP_PID)"
 
-          # Wait for app health check on port 3000
-          echo "Waiting for app to respond on http://127.0.0.1:3000/api/health..."
           APP_READY=0
           for i in {1..35}; do
             if curl -s http://127.0.0.1:3000/api/health | grep -q "healthy"; then
-              echo "App server is responding HEALTHY on http://127.0.0.1:3000 !"
-              curl -s http://127.0.0.1:3000/api/health
+              echo "App server is HEALTHY on http://127.0.0.1:3000"
               APP_READY=1
               break
             fi
@@ -308,33 +362,30 @@ jobs:
             exit 1
           fi
 
-          echo "=========================================================================="
-          echo " Connecting Cloudflare Tunnel to Custom Domain (84wala.uqn88.store)..."
-          echo "=========================================================================="
           if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
             nohup cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > cloudflared.log 2>&1 &
-            TUNNEL_PID=$!
-            echo "Cloudflare Tunnel service is active! PID: $TUNNEL_PID"
+            echo "Cloudflare Tunnel active."
           else
-            echo "WARNING: Secret 'CLOUDFLARE_TUNNEL_TOKEN' is not set! Running fallback quick tunnel..."
+            echo "WARNING: CLOUDFLARE_TUNNEL_TOKEN not set. Running fallback quick tunnel..."
             nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3000 > cloudflared.log 2>&1 &
-            TUNNEL_PID=$!
           fi
 
           sleep 5
-          echo "Initial Cloudflare Tunnel output:"
           head -n 25 cloudflared.log || true
 
           DURATION_HOURS=${{ github.event.inputs.duration_hours || '5' }}
           TOTAL_SECONDS=$((DURATION_HOURS * 3600))
-          INTERVAL=120 # probe every 2 minutes
+          INTERVAL=120
 
           echo "=========================================================================="
-          echo " Khanewal Connect is now LIVE on your Custom Domain via Cloudflare Tunnel!"
-          echo " Scheduled Live Session Duration: $DURATION_HOURS Hours ($TOTAL_SECONDS seconds)"
-          echo " Custom Domain: https://84wala.uqn88.store"
+          echo " Khanewal Connect is LIVE: https://84wala.uqn88.store"
+          echo " Duration: $DURATION_HOURS hours. Cancel anytime; final backup still runs."
           echo "=========================================================================="
-          echo "To stop early and save your MySQL database snapshot, click 'Cancel workflow' anytime."
+
+          # Take one backup right after start so Drive always has a snapshot of the restored state
+          if [ "$EXTERNAL_DB" != "true" ]; then
+            "$RUNNER_TEMP/kwl_backup.sh" || true
+          fi
 
           ELAPSED=0
           while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
@@ -343,118 +394,40 @@ jobs:
             MINUTES_RUN=$((ELAPSED / 60))
             MINUTES_REMAINING=$(((TOTAL_SECONDS - ELAPSED) / 60))
 
-            # Query health probe
             HEALTH_STATUS=$(curl -s http://127.0.0.1:3000/api/health || echo '{"status":"unreachable"}')
-            echo "[$(date -u +"%H:%M:%SZ")] Running: ${MINUTES_RUN}m elapsed | ${MINUTES_REMAINING}m remaining | Health: $HEALTH_STATUS"
+            echo "[$(date -u +"%H:%M:%SZ")] ${MINUTES_RUN}m elapsed | ${MINUTES_REMAINING}m remaining | Health: $HEALTH_STATUS"
 
-            # Periodic MySQL snapshot every 10 minutes (runner-local MySQL only).
-            # Dumped to a temp file and only kept if valid, so a failed dump can never overwrite a good backup.
+            # Encrypted backup to Drive every 10 minutes
             if [ "$EXTERNAL_DB" != "true" ] && [ $((ELAPSED % 600)) -eq 0 ]; then
-              if mysqldump -h 127.0.0.1 -u root \
-                  --databases omniserve_db \
-                  --single-transaction --routines --triggers --events \
-                  --add-drop-table --complete-insert 2>/dev/null | gzip -9 > mysql-backup/snapshot.tmp.gz \
-                 && gzip -t mysql-backup/snapshot.tmp.gz \
-                 && [ "$(stat -c%s mysql-backup/snapshot.tmp.gz)" -gt 1000 ]; then
-                mv mysql-backup/snapshot.tmp.gz mysql-backup/snapshot.sql.gz
-                echo "[$(date -u +"%H:%M:%SZ")] Periodic MySQL snapshot refreshed successfully."
-              else
-                rm -f mysql-backup/snapshot.tmp.gz
-                echo "[$(date -u +"%H:%M:%SZ")] WARNING: periodic snapshot failed; previous backup kept."
-              fi
+              "$RUNNER_TEMP/kwl_backup.sh" || true
             fi
 
-            # Auto-healing: If app crashed, restart it immediately
             if ! curl -s http://127.0.0.1:3000/api/health | grep -q "healthy"; then
               echo "WARNING: App health probe failed! Restarting server..."
-              cat app.log | tail -n 30 || true
+              tail -n 30 app.log || true
               nohup npx tsx server.ts > app.log 2>&1 &
               sleep 5
             fi
 
-            # Auto-healing: If tunnel crashed, restart it immediately
             if ! pgrep -f cloudflared > /dev/null; then
-              echo "WARNING: Cloudflare Tunnel process terminated! Restarting tunnel..."
+              echo "WARNING: Cloudflare Tunnel terminated! Restarting..."
               if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
                 nohup cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > cloudflared.log 2>&1 &
               fi
             fi
           done
 
-          echo "5-hour live session completed successfully."
+          echo "Live session completed successfully."
 
-      # =========================================================================
-      # 8. GUARANTEED ZERO-DATA-LOSS MYSQL SNAPSHOT (Runs on CANCEL, SUCCESS, TIMEOUT)
-      # =========================================================================
-      - name: Safely Capture MySQL Full Snapshot
+      # Final encrypted backup: runs on success, failure, cancel and timeout
+      - name: Final Encrypted Snapshot to Google Drive
         if: always() && steps.dbmode.outputs.external != 'true'
         env:
           MYSQL_PWD: root_password_123
         run: |
-          echo "=========================================================="
-          echo "Initiating Guaranteed Snapshot Capture (Zero-Data-Loss)..."
-          echo "=========================================================="
-          mkdir -p mysql-backup
-
           if mysqladmin ping -h 127.0.0.1 -u root --silent; then
-            echo "Taking clean mysqldump for application database 'omniserve_db' only..."
-            
-            # Dump ONLY application database 'omniserve_db' to avoid ERROR 3552 system tables
-            if mysqldump -h 127.0.0.1 -u root \
-              --databases omniserve_db \
-              --single-transaction \
-              --routines \
-              --triggers \
-              --events \
-              --add-drop-table \
-              --complete-insert \
-              | gzip -9 > mysql-backup/snapshot.tmp.gz \
-              && gzip -t mysql-backup/snapshot.tmp.gz \
-              && [ "$(stat -c%s mysql-backup/snapshot.tmp.gz)" -gt 1000 ]; then
-              mv mysql-backup/snapshot.tmp.gz mysql-backup/snapshot.sql.gz
-            else
-              rm -f mysql-backup/snapshot.tmp.gz
-              echo "WARNING: final dump failed validation; previous backup kept."
-            fi
-
-            FILESIZE=$(stat -c%s "mysql-backup/snapshot.sql.gz" 2>/dev/null || stat -f%z "mysql-backup/snapshot.sql.gz")
-            CHECKSUM=$(sha256sum "mysql-backup/snapshot.sql.gz" | awk '{print $1}')
-
-            cat <<EOF > mysql-backup/snapshot-meta.json
-          {
-            "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "git_commit": "${{ github.sha }}",
-            "git_ref": "${{ github.ref }}",
-            "run_id": "${{ github.run_id }}",
-            "run_attempt": "${{ github.run_attempt }}",
-            "workflow_status": "${{ job.status }}",
-            "database": "omniserve_db",
-            "size_bytes": $FILESIZE,
-            "sha256": "$CHECKSUM"
-          }
-          EOF
-
-            echo "Clean snapshot created successfully!"
-            ls -lh mysql-backup/
-            cat mysql-backup/snapshot-meta.json
+            "$RUNNER_TEMP/kwl_backup.sh"
+            rclone lsf kwlcrypt:history --files-only | sort | tail -n 3
           else
-            echo "Notice: MySQL server is unreachable. Existing backup retained."
+            echo "Notice: MySQL unreachable. Existing Drive backups retained."
           fi
-
-      # 9. Save Persistent Snapshot to GitHub Actions Cache for Next Run
-      - name: Save Persistent MySQL Database Cache
-        if: always() && steps.dbmode.outputs.external != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: mysql-backup
-          key: khanewal-prod-v4-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      # 10. Upload Snapshot as Workflow Artifact (90-Day Retention)
-      - name: Upload Snapshot as Redundant Workflow Artifact
-        if: always() && steps.dbmode.outputs.external != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: mysql-persistent-snapshot-${{ github.run_id }}
-          path: mysql-backup/
-          retention-days: 90
-          if-no-files-found: warn
